@@ -3,9 +3,9 @@ use std::cmp::min;
 use std::fmt;
 use std::fmt::Write as _;
 
-use super::event::{Container, Event};
 use super::TraversalContext;
 use super::Traverser;
+use super::event::{Container, Event};
 use crate::{SyntaxElement, SyntaxKind, SyntaxNode};
 
 /// A wrapper for escaping sensitive characters in html.
@@ -47,10 +47,38 @@ impl<S: AsRef<str>> fmt::Display for HtmlEscape<S> {
     }
 }
 
+// Export punctuation only in prose. Escaping each unchanged run before writing the
+// entity also keeps author-supplied markup inert without rewriting Org source.
+fn write_prose(output: &mut String, text: &str) {
+    let mut remaining = text;
+    while let Some(offset) = jetscii::bytes!(b'-', b'.').find(remaining.as_bytes()) {
+        let candidate = &remaining[offset..];
+        let (width, entity) = if candidate.starts_with("---") {
+            (3, "&mdash;")
+        } else if candidate.starts_with("--") {
+            (2, "&ndash;")
+        } else if candidate.starts_with("...") {
+            (3, "&hellip;")
+        } else {
+            // A lone punctuation mark is part of the next unmodified run.
+            let next = offset + 1;
+            let _ = write!(output, "{}", HtmlEscape(&remaining[..next]));
+            remaining = &remaining[next..];
+            continue;
+        };
+        let _ = write!(output, "{}", HtmlEscape(&remaining[..offset]));
+        output.push_str(entity);
+        remaining = &candidate[width..];
+    }
+    let _ = write!(output, "{}", HtmlEscape(remaining));
+}
+
 #[derive(Default)]
 pub struct HtmlExport {
     output: String,
 
+    prose_depth: usize,
+    literal_depth: usize,
     in_descriptive_list: Vec<bool>,
 
     table_row: TableRow,
@@ -98,6 +126,7 @@ impl Traverser for HtmlExport {
             Event::Leave(Container::Document(_)) => self.output += "</main>",
 
             Event::Enter(Container::Headline(headline)) => {
+                self.prose_depth += 1;
                 let level = min(headline.level(), 6);
                 let _ = write!(&mut self.output, "<h{level}>");
                 for elem in headline.title() {
@@ -105,10 +134,16 @@ impl Traverser for HtmlExport {
                 }
                 let _ = write!(&mut self.output, "</h{level}>");
             }
-            Event::Leave(Container::Headline(_)) => {}
+            Event::Leave(Container::Headline(_)) => self.prose_depth -= 1,
 
-            Event::Enter(Container::Paragraph(_)) => self.output += "<p>",
-            Event::Leave(Container::Paragraph(_)) => self.output += "</p>",
+            Event::Enter(Container::Paragraph(_)) => {
+                self.prose_depth += 1;
+                self.output += "<p>";
+            }
+            Event::Leave(Container::Paragraph(_)) => {
+                self.prose_depth -= 1;
+                self.output += "</p>";
+            }
 
             Event::Enter(Container::Section(_)) => self.output += "<section>",
             Event::Leave(Container::Section(_)) => self.output += "</section>",
@@ -125,13 +160,17 @@ impl Traverser for HtmlExport {
             Event::Enter(Container::Underline(_)) => self.output += "<u>",
             Event::Leave(Container::Underline(_)) => self.output += "</u>",
 
-            Event::Enter(Container::Verbatim(_)) => self.output += "<code>",
-            Event::Leave(Container::Verbatim(_)) => self.output += "</code>",
-
-            Event::Enter(Container::Code(_)) => self.output += "<code>",
-            Event::Leave(Container::Code(_)) => self.output += "</code>",
+            Event::Enter(Container::Verbatim(_) | Container::Code(_)) => {
+                self.literal_depth += 1;
+                self.output += "<code>";
+            }
+            Event::Leave(Container::Verbatim(_) | Container::Code(_)) => {
+                self.literal_depth -= 1;
+                self.output += "</code>";
+            }
 
             Event::Enter(Container::SourceBlock(block)) => {
+                self.literal_depth += 1;
                 if let Some(language) = block.language() {
                     let _ = write!(
                         &mut self.output,
@@ -142,16 +181,31 @@ impl Traverser for HtmlExport {
                     self.output += r#"<pre><code>"#
                 }
             }
-            Event::Leave(Container::SourceBlock(_)) => self.output += "</code></pre>",
+            Event::Leave(Container::SourceBlock(_)) => {
+                self.literal_depth -= 1;
+                self.output += "</code></pre>";
+            }
 
             Event::Enter(Container::QuoteBlock(_)) => self.output += "<blockquote>",
             Event::Leave(Container::QuoteBlock(_)) => self.output += "</blockquote>",
 
-            Event::Enter(Container::VerseBlock(_)) => self.output += "<p class=\"verse\">",
-            Event::Leave(Container::VerseBlock(_)) => self.output += "</p>",
+            Event::Enter(Container::VerseBlock(_)) => {
+                self.prose_depth += 1;
+                self.output += "<p class=\"verse\">";
+            }
+            Event::Leave(Container::VerseBlock(_)) => {
+                self.prose_depth -= 1;
+                self.output += "</p>";
+            }
 
-            Event::Enter(Container::ExampleBlock(_)) => self.output += "<pre class=\"example\">",
-            Event::Leave(Container::ExampleBlock(_)) => self.output += "</pre>",
+            Event::Enter(Container::ExampleBlock(_)) => {
+                self.literal_depth += 1;
+                self.output += "<pre class=\"example\">";
+            }
+            Event::Leave(Container::ExampleBlock(_)) => {
+                self.literal_depth -= 1;
+                self.output += "</pre>";
+            }
 
             Event::Enter(Container::CenterBlock(_)) => self.output += "<div class=\"center\">",
             Event::Leave(Container::CenterBlock(_)) => self.output += "</div>",
@@ -191,6 +245,7 @@ impl Traverser for HtmlExport {
                 self.in_descriptive_list.pop();
             }
             Event::Enter(Container::ListItem(list_item)) => {
+                self.prose_depth += 1;
                 if let Some(&true) = self.in_descriptive_list.last() {
                     self.output += "<dt>";
                     for elem in list_item.tag() {
@@ -202,6 +257,7 @@ impl Traverser for HtmlExport {
                 }
             }
             Event::Leave(Container::ListItem(_)) => {
+                self.prose_depth -= 1;
                 if let Some(&true) = self.in_descriptive_list.last() {
                     self.output += "</dd>";
                 } else {
@@ -272,8 +328,14 @@ impl Traverser for HtmlExport {
                     self.output += "</tr>";
                 }
             }
-            Event::Enter(Container::OrgTableCell(_)) => self.output += "<td>",
-            Event::Leave(Container::OrgTableCell(_)) => self.output += "</td>",
+            Event::Enter(Container::OrgTableCell(_)) => {
+                self.prose_depth += 1;
+                self.output += "<td>";
+            }
+            Event::Leave(Container::OrgTableCell(_)) => {
+                self.prose_depth -= 1;
+                self.output += "</td>";
+            }
 
             Event::Enter(Container::Link(link)) => {
                 let path = link.path();
@@ -294,7 +356,11 @@ impl Traverser for HtmlExport {
             Event::Leave(Container::Link(_)) => self.output += "</a>",
 
             Event::Text(text) => {
-                let _ = write!(&mut self.output, "{}", HtmlEscape(text));
+                if self.prose_depth > 0 && self.literal_depth == 0 {
+                    write_prose(&mut self.output, &text.to_string());
+                } else {
+                    let _ = write!(&mut self.output, "{}", HtmlEscape(text));
+                }
             }
 
             Event::LineBreak(_) => self.output += "<br/>",
