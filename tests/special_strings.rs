@@ -23,6 +23,18 @@ fn special_strings_in_headlines() {
 }
 
 #[test]
+fn standalone_post_title_uses_prose_export_without_rewriting_source() {
+    // Jaunder renders a Post title as a standalone Org document, not a headline.
+    let source = "Three---two--one... *bold--word*";
+    let org = Org::parse(source);
+    assert_eq!(org.to_org(), source);
+    assert_eq!(
+        org.to_html(),
+        "<main><section><p>Three&mdash;two&ndash;one&hellip; <b>bold&ndash;word</b></p></section></main>"
+    );
+}
+
+#[test]
 fn literal_contexts_and_link_destinations_remain_source_exact() {
     let source = "~code---...~ =verbatim--...= [[https://example.org/a---b?q=x--y][label---text]]\n\n#+begin_src text\ncode--- -- ...\n#+end_src";
     let org = Org::parse(source);
