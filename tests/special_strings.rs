@@ -40,3 +40,20 @@ fn literal_contexts_and_link_destinations_remain_source_exact() {
         "{html}"
     );
 }
+
+#[test]
+fn nested_list_literal_blocks_do_not_export_special_strings() {
+    let source = "- prose---text\n  #+begin_comment\n  comment--- -- ...\n  #+end_comment\n  #+begin_example\n  example--- -- ...\n  #+end_example\n  : fixed--- -- ...\n  #+begin_export html\n  export--- -- ...\n  #+end_export";
+    let org = Org::parse(source);
+    assert_eq!(org.to_org(), source);
+    let html = org.to_html();
+    assert!(html.contains("prose&mdash;text"), "{html}");
+    for literal in [
+        "comment--- -- ...",
+        "example--- -- ...",
+        "fixed--- -- ...",
+        "export--- -- ...",
+    ] {
+        assert!(html.contains(literal), "missing literal {literal}: {html}");
+    }
+}

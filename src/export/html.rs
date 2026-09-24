@@ -210,11 +210,21 @@ impl Traverser for HtmlExport {
             Event::Enter(Container::CenterBlock(_)) => self.output += "<div class=\"center\">",
             Event::Leave(Container::CenterBlock(_)) => self.output += "</div>",
 
-            Event::Enter(Container::CommentBlock(_)) => self.output += "<!--",
-            Event::Leave(Container::CommentBlock(_)) => self.output += "-->",
+            Event::Enter(Container::CommentBlock(_) | Container::Comment(_)) => {
+                self.literal_depth += 1;
+                self.output += "<!--";
+            }
+            Event::Leave(Container::CommentBlock(_) | Container::Comment(_)) => {
+                self.literal_depth -= 1;
+                self.output += "-->";
+            }
 
-            Event::Enter(Container::Comment(_)) => self.output += "<!--",
-            Event::Leave(Container::Comment(_)) => self.output += "-->",
+            Event::Enter(Container::FixedWidth(_) | Container::ExportBlock(_)) => {
+                self.literal_depth += 1;
+            }
+            Event::Leave(Container::FixedWidth(_) | Container::ExportBlock(_)) => {
+                self.literal_depth -= 1;
+            }
 
             Event::Enter(Container::Subscript(_)) => self.output += "<sub>",
             Event::Leave(Container::Subscript(_)) => self.output += "</sub>",
