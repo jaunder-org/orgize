@@ -1,12 +1,16 @@
-use rowan::NodeOrToken;
+use rowan::{NodeOrToken, ast::AstNode};
 use std::cmp::min;
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 
 use super::TraversalContext;
 use super::Traverser;
 use super::event::{Container, Event};
-use crate::{SyntaxElement, SyntaxKind, SyntaxNode};
+use crate::{
+    SyntaxElement, SyntaxKind, SyntaxNode,
+    ast::{FnDef, FnRef},
+};
 
 /// A wrapper for escaping sensitive characters in html.
 ///
@@ -82,6 +86,16 @@ pub struct HtmlExport {
     in_descriptive_list: Vec<bool>,
 
     table_row: TableRow,
+
+    footnote_namespace: Option<i64>,
+    definitions: HashMap<String, SyntaxNode>,
+    notes: Vec<Footnote>,
+}
+
+struct Footnote {
+    label: String,
+    definition: SyntaxNode,
+    references: usize,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -94,6 +108,90 @@ enum TableRow {
 }
 
 impl HtmlExport {
+    /// Give links within a Post a stable, collision-free fragment namespace.
+    /// The same Post ID must be supplied on creation, update, and rebuild.
+    pub fn with_footnote_namespace(post_id: i64) -> Self {
+        Self {
+            footnote_namespace: Some(post_id),
+            ..Self::default()
+        }
+    }
+
+    fn label(node: &SyntaxNode) -> Option<String> {
+        let mut children = node.children_with_tokens();
+        children.find(|child| child.kind() == SyntaxKind::COLON)?;
+        match children.next()? {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::TEXT => {
+                Some(token.text().to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn inline_definition(node: &SyntaxNode) -> bool {
+        node.children_with_tokens()
+            .filter(|child| child.kind() == SyntaxKind::COLON)
+            .count()
+            > 1
+    }
+
+    fn note_id(&self, number: usize) -> String {
+        match self.footnote_namespace {
+            Some(id) => format!("post-{id}-fn-{number}"),
+            None => format!("fn-{number}"),
+        }
+    }
+
+    fn reference_id(&self, number: usize, occurrence: usize) -> String {
+        match self.footnote_namespace {
+            Some(id) => format!("post-{id}-fnref-{number}-{occurrence}"),
+            None => format!("fnref-{number}-{occurrence}"),
+        }
+    }
+
+    fn render_note_body(&mut self, node: &SyntaxNode, ctx: &mut TraversalContext) {
+        let mut colons = 0;
+        let mut content = false;
+        for child in node.children_with_tokens() {
+            if !content {
+                if node.kind() == SyntaxKind::FN_DEF && child.kind() == SyntaxKind::R_BRACKET {
+                    content = true;
+                } else if node.kind() == SyntaxKind::FN_REF && child.kind() == SyntaxKind::COLON {
+                    colons += 1;
+                    content = colons == 2;
+                }
+                continue;
+            }
+            if node.kind() == SyntaxKind::FN_REF && child.kind() == SyntaxKind::R_BRACKET {
+                break;
+            }
+            self.element(child, ctx);
+        }
+    }
+
+    fn render_notes(&mut self, ctx: &mut TraversalContext) {
+        if self.notes.is_empty() {
+            return;
+        }
+        self.output += "<section class=\"footnotes\"><h2>Footnotes</h2><ol>";
+        let mut index = 0;
+        while index < self.notes.len() {
+            let number = index + 1;
+            let definition = self.notes[index].definition.clone();
+            let note_id = self.note_id(number);
+            let _ = write!(&mut self.output, "<li id=\"{note_id}\"><p>");
+            self.render_note_body(&definition, ctx);
+            self.output += "</p>";
+            for occurrence in 1..=self.notes[index].references {
+                let reference_id = self.reference_id(number, occurrence);
+                let _ = write!(&mut self.output, " <a href=\"#{reference_id}\">↩</a>");
+            }
+            self.output += "</li>";
+            index += 1;
+        }
+        self.output += "</ol></section>";
+    }
+
     pub fn push_str(&mut self, s: impl AsRef<str>) {
         self.output += s.as_ref();
     }
@@ -122,8 +220,76 @@ impl HtmlExport {
 impl Traverser for HtmlExport {
     fn event(&mut self, event: Event, ctx: &mut TraversalContext) {
         match event {
-            Event::Enter(Container::Document(_)) => self.output += "<main>",
-            Event::Leave(Container::Document(_)) => self.output += "</main>",
+            Event::Enter(Container::Document(document)) => {
+                self.definitions.clear();
+                self.notes.clear();
+                for definition in document.syntax().descendants().filter_map(FnDef::cast) {
+                    if let Some(label) = Self::label(definition.syntax()) {
+                        self.definitions
+                            .entry(label)
+                            .or_insert_with(|| definition.syntax().clone());
+                    }
+                }
+                for reference in document.syntax().descendants().filter_map(FnRef::cast) {
+                    if Self::inline_definition(reference.syntax()) {
+                        if let Some(label) =
+                            Self::label(reference.syntax()).filter(|label| !label.is_empty())
+                        {
+                            self.definitions
+                                .entry(label)
+                                .or_insert_with(|| reference.syntax().clone());
+                        }
+                    }
+                }
+                self.output += "<main>";
+            }
+            Event::Leave(Container::Document(_)) => {
+                self.render_notes(ctx);
+                self.output += "</main>";
+            }
+
+            Event::Enter(Container::FnDef(_)) => ctx.skip(),
+            Event::Enter(Container::FnRef(reference)) => {
+                let node = reference.syntax();
+                let inline = Self::inline_definition(node);
+                let label = Self::label(node).unwrap_or_default();
+                let label = if label.is_empty() && inline {
+                    format!("anonymous-{}", u32::from(node.text_range().start()))
+                } else {
+                    label
+                };
+                let definition = if inline {
+                    Some(node.clone())
+                } else {
+                    self.definitions.get(&label).cloned()
+                };
+                if let Some(definition) = definition {
+                    let index = self
+                        .notes
+                        .iter()
+                        .position(|note| note.label == label)
+                        .unwrap_or_else(|| {
+                            self.notes.push(Footnote {
+                                label,
+                                definition,
+                                references: 0,
+                            });
+                            self.notes.len() - 1
+                        });
+                    self.notes[index].references += 1;
+                    let number = index + 1;
+                    let occurrence = self.notes[index].references;
+                    let reference_id = self.reference_id(number, occurrence);
+                    let note_id = self.note_id(number);
+                    let _ = write!(
+                        &mut self.output,
+                        "<sup class=\"footnote-reference\" id=\"{reference_id}\"><a href=\"#{note_id}\">{number}</a></sup>"
+                    );
+                } else {
+                    let _ = write!(&mut self.output, "{}", HtmlEscape(reference.raw()));
+                }
+                ctx.skip();
+            }
 
             Event::Enter(Container::Headline(headline)) => {
                 self.prose_depth += 1;
