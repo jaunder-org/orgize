@@ -1,18 +1,18 @@
 use nom::{
+    IResult, InputTake,
     bytes::complete::{tag, take_while1},
-    combinator::map,
     sequence::tuple,
-    IResult,
 };
 
 use super::{
+    SyntaxKind,
     combinator::{
-        blank_lines, colon_token, l_bracket_token, r_bracket_token, trim_line_end, GreenElement,
-        NodeBuilder,
+        GreenElement, NodeBuilder, blank_lines, colon_token, l_bracket_token, line_ends_iter,
+        r_bracket_token,
     },
     input::Input,
     keyword::affiliated_keyword_nodes,
-    SyntaxKind,
+    object::standard_object_nodes,
 };
 
 #[cfg_attr(
@@ -20,42 +20,36 @@ use super::{
   tracing::instrument(level = "debug", skip(input), fields(input = input.s))
 )]
 pub fn fn_def_node(input: Input) -> IResult<Input, GreenElement, ()> {
-    let mut parser = map(
-        tuple((
-            affiliated_keyword_nodes,
-            l_bracket_token,
-            tag("fn"),
-            colon_token,
-            take_while1(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-            r_bracket_token,
-            trim_line_end,
-            blank_lines,
-        )),
-        |(
-            affiliated_keywords,
-            l_bracket,
-            fn_,
-            colon,
-            label,
-            r_bracket,
-            (content, ws_, nl),
-            post_blank,
-        )| {
-            let mut b = NodeBuilder::new();
-            b.children.extend(affiliated_keywords);
-            b.push(l_bracket);
-            b.text(fn_);
-            b.push(colon);
-            b.text(label);
-            b.push(r_bracket);
-            b.text(content);
-            b.ws(ws_);
-            b.nl(nl);
-            b.children.extend(post_blank);
-            b.finish(SyntaxKind::FN_DEF)
-        },
-    );
-    crate::lossless_parser!(parser, input)
+    let (remaining, (affiliated_keywords, l_bracket, fn_, colon, label, r_bracket)) = tuple((
+        affiliated_keyword_nodes,
+        l_bracket_token,
+        tag("fn"),
+        colon_token,
+        take_while1(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        r_bracket_token,
+    ))(input)?;
+    // Continue a definition until a blank line or the next definition. Parse
+    // its contents with the ordinary Org object parser, not as opaque text.
+    let mut end = 0;
+    for idx in line_ends_iter(remaining.as_str()) {
+        let line = &remaining.as_str()[end..idx];
+        if end > 0 && (line.trim().is_empty() || line.starts_with("[fn:")) {
+            break;
+        }
+        end = idx;
+    }
+    let (remaining, contents) = remaining.take_split(end);
+    let (remaining, post_blank) = blank_lines(remaining)?;
+    let mut b = NodeBuilder::new();
+    b.children.extend(affiliated_keywords);
+    b.push(l_bracket);
+    b.text(fn_);
+    b.push(colon);
+    b.text(label);
+    b.push(r_bracket);
+    b.children.extend(standard_object_nodes(contents));
+    b.children.extend(post_blank);
+    Ok((remaining, b.finish(SyntaxKind::FN_DEF)))
 }
 
 #[test]
@@ -125,8 +119,7 @@ fn parse() {
       COLON@3..4 ":"
       TEXT@4..5 "1"
       R_BRACKET@5..6 "]"
-      TEXT@6..65 " In particular, the p ..."
-      NEW_LINE@65..66 "\n"
+      TEXT@6..66 " In particular, the p ..."
     "###
     );
 
