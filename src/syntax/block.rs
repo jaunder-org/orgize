@@ -158,7 +158,13 @@ fn block_end_node<'a>(input: Input<'a>, name: &str) -> IResult<Input<'a>, GreenE
     let (input, (ws, end, name, ws_, nl)) = tuple((
         space0,
         tag_no_case("#+END_"),
-        tag_no_case(name),
+        |input| {
+            if name.eq_ignore_ascii_case("VERSE") || name.eq_ignore_ascii_case("QUOTE") {
+                tag_no_case(name)(input)
+            } else {
+                tag(name)(input)
+            }
+        },
         space0,
         eol_or_eof,
     ))(input)?;
@@ -207,6 +213,28 @@ fn comma_quoted_text_nodes(input: Input) -> Vec<GreenElement> {
 )]
 pub fn block_node(input: Input) -> IResult<Input, GreenElement, ()> {
     crate::lossless_parser!(block_node_base, input)
+}
+
+#[test]
+fn unrelated_blocks_keep_exact_closing_names() {
+    let config = crate::ParseConfig::default();
+    for block in ["src", "example", "comment", "export", "center", "custom"] {
+        for (begin, mixed_end) in [
+            (block.to_owned(), block.to_uppercase()),
+            (block.to_uppercase(), block.to_owned()),
+        ] {
+            let mixed = format!("#+BEGIN_{begin}\nplain body\n#+end_{mixed_end}");
+            assert!(
+                block_node((mixed.as_str(), &config).into()).is_err(),
+                "{mixed}"
+            );
+            let exact = format!("#+BEGIN_{begin}\nplain body\n#+end_{begin}");
+            assert!(
+                block_node((exact.as_str(), &config).into()).is_ok(),
+                "{exact}"
+            );
+        }
+    }
 }
 
 #[test]
