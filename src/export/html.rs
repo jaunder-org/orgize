@@ -77,12 +77,78 @@ fn write_prose(output: &mut String, text: &str) {
     let _ = write!(output, "{}", HtmlEscape(remaining));
 }
 
+/// Verse is an inline stream, but physical prose lines keep their layout.
+/// Track columns across text tokens so indentation before inline markup is
+/// emitted outside the tag. Code and verbatim text bypass this transformation.
+#[derive(Default)]
+struct VerseLayout {
+    common_indent: usize,
+    pending_columns: usize,
+    started: bool,
+}
+
+fn indentation(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .fold(0, |columns, ch| {
+            if ch == '\t' {
+                columns + 8 - columns % 8
+            } else {
+                columns + 1
+            }
+        })
+}
+
+impl VerseLayout {
+    fn start_line(&mut self, output: &mut String) {
+        if !self.started {
+            for _ in 0..self.pending_columns.saturating_sub(self.common_indent) {
+                output.push_str("&nbsp;");
+            }
+            self.started = true;
+        }
+    }
+
+    fn next_line(&mut self) {
+        self.pending_columns = 0;
+        self.started = false;
+    }
+
+    fn write_text(&mut self, output: &mut String, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for line in normalized.split_inclusive('\n') {
+            let (mut text, newline) = line
+                .strip_suffix('\n')
+                .map_or((line, false), |text| (text, true));
+            if !self.started {
+                for ch in text.chars().take_while(|ch| matches!(ch, ' ' | '\t')) {
+                    self.pending_columns += if ch == '\t' {
+                        8 - self.pending_columns % 8
+                    } else {
+                        1
+                    };
+                }
+                text = text.trim_start_matches([' ', '\t']);
+            }
+            if !text.is_empty() {
+                self.start_line(output);
+                write_prose(output, text);
+            }
+            if newline {
+                output.push_str("<br/>");
+                self.next_line();
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct HtmlExport {
     output: String,
 
     prose_depth: usize,
     literal_depth: usize,
+    verse: Option<VerseLayout>,
     in_descriptive_list: Vec<bool>,
 
     table_row: TableRow,
@@ -219,6 +285,11 @@ impl HtmlExport {
 
 impl Traverser for HtmlExport {
     fn event(&mut self, event: Event, ctx: &mut TraversalContext) {
+        if !matches!(event, Event::Text(_) | Event::Leave(_)) {
+            if let Some(verse) = &mut self.verse {
+                verse.start_line(&mut self.output);
+            }
+        }
         match event {
             Event::Enter(Container::Document(document)) => {
                 self.definitions.clear();
@@ -355,11 +426,27 @@ impl Traverser for HtmlExport {
             Event::Enter(Container::QuoteBlock(_)) => self.output += "<blockquote>",
             Event::Leave(Container::QuoteBlock(_)) => self.output += "</blockquote>",
 
-            Event::Enter(Container::VerseBlock(_)) => {
+            Event::Enter(Container::VerseBlock(block)) => {
+                let content = block
+                    .syntax()
+                    .children()
+                    .find(|child| child.kind() == SyntaxKind::BLOCK_CONTENT)
+                    .map(|child| child.to_string())
+                    .unwrap_or_default();
+                self.verse = Some(VerseLayout {
+                    common_indent: content
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(indentation)
+                        .min()
+                        .unwrap_or(0),
+                    ..VerseLayout::default()
+                });
                 self.prose_depth += 1;
                 self.output += "<p class=\"verse\">";
             }
             Event::Leave(Container::VerseBlock(_)) => {
+                self.verse = None;
                 self.prose_depth -= 1;
                 self.output += "</p>";
             }
@@ -533,13 +620,22 @@ impl Traverser for HtmlExport {
 
             Event::Text(text) => {
                 if self.prose_depth > 0 && self.literal_depth == 0 {
-                    write_prose(&mut self.output, &text.to_string());
+                    if let Some(verse) = &mut self.verse {
+                        verse.write_text(&mut self.output, &text.to_string());
+                    } else {
+                        write_prose(&mut self.output, &text.to_string());
+                    }
                 } else {
                     let _ = write!(&mut self.output, "{}", HtmlEscape(text));
                 }
             }
 
-            Event::LineBreak(_) => self.output += "<br/>",
+            Event::LineBreak(_) => {
+                self.output += "<br/>";
+                if let Some(verse) = &mut self.verse {
+                    verse.next_line();
+                }
+            }
 
             Event::Snippet(snippet) => {
                 if snippet.backend().eq_ignore_ascii_case("html") {

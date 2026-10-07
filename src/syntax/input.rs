@@ -1,7 +1,7 @@
 use nom::{
-    error::{ErrorKind, ParseError},
     Compare, CompareResult, Err, FindSubstring, IResult, InputIter, InputLength, InputTake,
     InputTakeAtPosition, Needed, Offset, Slice,
+    error::{ErrorKind, ParseError},
 };
 use std::{
     ops::{Deref, Range, RangeFrom, RangeFull, RangeTo},
@@ -9,24 +9,54 @@ use std::{
 };
 
 use super::{
-    combinator::{token, GreenElement},
     SyntaxKind,
+    combinator::{GreenElement, token},
 };
 use crate::config::ParseConfig;
 
+/// Inline grammar context travels with input slices, including through nested
+/// emphasis, links, and footnotes. Retaining the full verse slice distinguishes
+/// an actual physical line start from the start of an inline object's contents.
+#[derive(Clone, Copy, Debug)]
+enum InlineContext<'a> {
+    Standard,
+    Verse(&'a str),
+}
+
 /// A custom Input struct
 ///
-/// It helps us to pass the `ParseConfig` all the way down to each parsers
+/// It passes `ParseConfig` and inline grammar context down to each parser.
 #[derive(Clone, Copy, Debug)]
 pub struct Input<'a> {
     pub(crate) s: &'a str,
     pub(crate) c: &'a ParseConfig,
+    context: InlineContext<'a>,
 }
 
 impl<'a> Input<'a> {
     #[inline]
     pub(crate) fn of(&self, i: &'a str) -> Input<'a> {
-        Input { s: i, c: self.c }
+        Input { s: i, ..*self }
+    }
+
+    pub(crate) fn in_verse(self) -> Self {
+        Self {
+            context: InlineContext::Verse(self.s),
+            ..self
+        }
+    }
+
+    #[cfg(feature = "syntax-org-fc")]
+    pub(crate) fn is_verse(&self) -> bool {
+        matches!(self.context, InlineContext::Verse(_))
+    }
+
+    pub(crate) fn is_verse_line_start(&self) -> bool {
+        let InlineContext::Verse(source) = self.context else {
+            return false;
+        };
+        let offset = source.offset(self.s);
+        offset == 0 || matches!(source.as_bytes()[offset - 1], b'\r' | b'\n')
     }
 
     #[inline]
@@ -69,6 +99,7 @@ impl<'a> From<(&'a str, &'a ParseConfig)> for Input<'a> {
         Input {
             s: value.0,
             c: value.1,
+            context: InlineContext::Standard,
         }
     }
 }

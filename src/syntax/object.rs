@@ -1,7 +1,8 @@
 use nom::{IResult, InputTake};
 
 use super::{
-    combinator::GreenElement,
+    SyntaxKind::COMMA,
+    combinator::{GreenElement, token},
     cookie::cookie_node,
     emphasis::{
         self, bold_node, code_node, italic_node, strike_node, underline_node, verbatim_node,
@@ -42,8 +43,8 @@ impl ObjectPositions<'_> {
                 b's', /* inline source */
                 b'\\', b'$', /* latex & entity */
                 b'{', /* macros */
-                b'^', /* superscript */
-                b'_'  /* subscript */
+                b',', /* comma-quoted verse lines */
+                b'^'  /* superscript; subscript '_' is already included above */
             ),
         }
     }
@@ -55,6 +56,7 @@ impl ObjectPositions<'_> {
             finder: jetscii::bytes!(
                 b'*', b'+', b'/', b'_', b'=', b'~', /* text markup */
                 b'\\', b'$', /* latex & entity */
+                b',', /* comma-quoted verse lines */
                 b'^', /* superscript */
                 b'_'  /* subscript */
             ),
@@ -72,6 +74,7 @@ impl ObjectPositions<'_> {
                 b'c', /* inline call */
                 b's', /* inline source */
                 b'{', /* macros */
+                b',', /* comma-quoted verse lines */
                 b'[', /* cookie */
                 b'^', /* superscript */
                 b'_'  /* subscript */
@@ -120,6 +123,7 @@ pub fn minimal_object_nodes(input: Input) -> Vec<GreenElement> {
     object_nodes(
         ObjectPositions::minimal,
         |i: Input, pre: Input| match &i.as_bytes()[0] {
+            b',' => comma_quoted_node(i),
             b'*' if emphasis::verify_pre(pre.s) => bold_node(i),
             b'+' if emphasis::verify_pre(pre.s) => strike_node(i),
             b'/' if emphasis::verify_pre(pre.s) => italic_node(i),
@@ -170,12 +174,19 @@ pub fn standard_object_nodes(input: Input) -> Vec<GreenElement> {
             b'{' => {
                 cfg_if::cfg_if! {
                     if #[cfg(feature = "syntax-org-fc")] {
-                        macros_node(i).or_else(|_| super::cloze::cloze_node(i))
+                        macros_node(i).or_else(|_| {
+                            if i.is_verse() {
+                                Err(nom::Err::Error(()))
+                            } else {
+                                super::cloze::cloze_node(i)
+                            }
+                        })
                     } else {
                         macros_node(i)
                     }
                 }
             }
+            b',' => comma_quoted_node(i),
             b'<' => radio_target_node(i)
                 .or_else(|_| target_node(i))
                 .or_else(|_| timestamp_diary_node(i))
@@ -199,10 +210,26 @@ pub fn standard_object_nodes(input: Input) -> Vec<GreenElement> {
     )
 }
 
+/// Verse uses Org inline objects and comma escaping, not the optional org-fc
+/// cloze extension. Input carries this context through recursive object parsers.
+pub fn verse_object_nodes(input: Input) -> Vec<GreenElement> {
+    standard_object_nodes(input.in_verse())
+}
+
+fn comma_quoted_node(input: Input) -> IResult<Input, GreenElement, ()> {
+    if input.is_verse_line_start() && (input.s.starts_with(",*") || input.s.starts_with(",#+")) {
+        let (remaining, comma) = input.take_split(1);
+        Ok((remaining, token(COMMA, comma.s)))
+    } else {
+        Err(nom::Err::Error(()))
+    }
+}
+
 pub fn link_description_object_nodes(input: Input) -> Vec<GreenElement> {
     object_nodes(
         ObjectPositions::link_description,
         |i: Input<'_>, pre: Input<'_>| match &i.as_bytes()[0] {
+            b',' => comma_quoted_node(i),
             b'@' => snippet_node(i),
             b'c' if emphasis::verify_pre(pre.s) => inline_call_node(i),
             b's' if emphasis::verify_pre(pre.s) => inline_src_node(i),
@@ -293,8 +320,8 @@ fn positions() {
 #[test]
 fn parse() {
     use crate::{
-        syntax::{combinator::node, SyntaxKind, SyntaxNode},
         ParseConfig,
+        syntax::{SyntaxKind, SyntaxNode, combinator::node},
     };
 
     let t = |input: &str| {
