@@ -1,15 +1,15 @@
 use nom::{
+    IResult,
     bytes::complete::{tag, take_while},
     character::complete::{space0, space1},
     combinator::{iterator, opt},
     sequence::tuple,
-    IResult,
 };
 
 use super::{
-    combinator::{blank_lines, eol_or_eof, GreenElement, NodeBuilder},
-    input::Input,
     SyntaxKind,
+    combinator::{GreenElement, NodeBuilder, blank_lines, eol_or_eof},
+    input::Input,
 };
 
 fn comment_node_base(input: Input) -> IResult<Input, GreenElement, ()> {
@@ -61,20 +61,17 @@ pub fn comment_node(input: Input) -> IResult<Input, GreenElement, ()> {
 #[test]
 fn parse() {
     use crate::{
-        syntax::{comment::comment_node, input::Input, SyntaxNode},
         ParseConfig,
+        syntax::{SyntaxNode, comment::comment_node},
     };
 
     let t = |input: &str| {
         SyntaxNode::new_root(
-            comment_node(Input {
-                s: input,
-                c: &ParseConfig::default(),
-            })
-            .unwrap()
-            .1
-            .into_node()
-            .unwrap(),
+            comment_node((input, &ParseConfig::default()).into())
+                .unwrap()
+                .1
+                .into_node()
+                .unwrap(),
         )
     };
 

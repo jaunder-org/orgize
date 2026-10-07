@@ -1,27 +1,27 @@
 use nom::{
+    IResult, InputTake,
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_while, take_while1},
     character::complete::{alpha1, space0, space1},
     combinator::{cond, opt},
     sequence::{separated_pair, tuple},
-    IResult, InputTake,
 };
 
 use super::{
+    SyntaxKind::*,
     combinator::{
-        blank_lines, eol_or_eof, line_starts_iter, node, token, trim_line_end, GreenElement,
-        NodeBuilder,
+        GreenElement, NodeBuilder, blank_lines, eol_or_eof, line_starts_iter, node, token,
+        trim_line_end,
     },
     element::element_nodes,
     input::Input,
     keyword::affiliated_keyword_nodes,
-    SyntaxKind::*,
+    object::verse_object_nodes,
 };
 
 fn block_node_base(input: Input) -> IResult<Input, GreenElement, ()> {
     let (input, affiliated_keywords) = affiliated_keyword_nodes(input)?;
     let (input, (block_begin, name)) = block_begin_node(input)?;
-    let (input, pre_blank) = blank_lines(input)?;
 
     let kind = match name {
         s if s.eq_ignore_ascii_case("COMMENT") => COMMENT_BLOCK,
@@ -33,6 +33,12 @@ fn block_node_base(input: Input) -> IResult<Input, GreenElement, ()> {
         s if s.eq_ignore_ascii_case("VERSE") => VERSE_BLOCK,
         _ => SPECIAL_BLOCK,
     };
+    // A verse's leading blank lines are authored layout, not block metadata.
+    let (input, pre_blank) = if kind == VERSE_BLOCK {
+        (input, vec![])
+    } else {
+        blank_lines(input)?
+    };
 
     for (input, contents) in line_starts_iter(&input).map(|i| input.take_split(i)) {
         if let Ok((input, block_end)) = block_end_node(input, name) {
@@ -42,7 +48,11 @@ fn block_node_base(input: Input) -> IResult<Input, GreenElement, ()> {
             children.extend(affiliated_keywords);
             children.push(block_begin);
             children.extend(pre_blank);
-            if kind.is_greater_element() {
+            if kind == VERSE_BLOCK {
+                // Parse one inline stream: emphasis and links can span a newline,
+                // while footnotes keep their positions in the original document.
+                children.push(node(BLOCK_CONTENT, verse_object_nodes(contents)));
+            } else if kind.is_greater_element() {
                 children.push(node(BLOCK_CONTENT, element_nodes(contents)?));
             } else {
                 children.push(node(BLOCK_CONTENT, comma_quoted_text_nodes(contents)));
@@ -145,8 +155,13 @@ fn source_block_switches(input: Input) -> IResult<Input, Input, ()> {
 }
 
 fn block_end_node<'a>(input: Input<'a>, name: &str) -> IResult<Input<'a>, GreenElement, ()> {
-    let (input, (ws, end, name, ws_, nl)) =
-        tuple((space0, tag_no_case("#+END_"), tag(name), space0, eol_or_eof))(input)?;
+    let (input, (ws, end, name, ws_, nl)) = tuple((
+        space0,
+        tag_no_case("#+END_"),
+        tag_no_case(name),
+        space0,
+        eol_or_eof,
+    ))(input)?;
 
     let mut b = NodeBuilder::new();
     b.ws(ws);
